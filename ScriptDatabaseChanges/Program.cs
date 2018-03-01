@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Data.SqlClient;
 using System.Diagnostics;
 using System.IO;
@@ -20,23 +21,79 @@ namespace ScriptDatabaseChanges
 
         static void Main(string[] args)
         {
+
             var parameters = ParseParameters(args);
-            TableDiffFilePath = GetTableDiffUtilityPath();
+            // TableDiffFilePath = GetTableDiffUtilityPath();
 
-            var tables = GetTableList(parameters);
+            // var tables = GetTableList(parameters);
 
-            var totalCount = tables.Count;
-            Parallel.ForEach(tables, t =>
+            // var totalCount = tables.Count;
+            // Parallel.ForEach(tables, t =>
+            // {
+            //     var changeScript = GenerateChangeScript(t, parameters);
+            //     AppendChangeScript(changeScript);
+
+            //     Interlocked.Increment(ref _counter);
+            //     Console.WriteLine($"Finised {_counter} of {totalCount}.");
+            // });
+            _builder = new StringBuilder(File.ReadAllText("changeScript.sql"));
+
+            var tablesWithUnsupportedColumns = GetUnsupportedColumns();
+            var columnsToCheck = ParseUnsupportedColumns();
+
+            // var completeChangeScript = _builder.ToString();
+            // File.WriteAllText("changeScript.sql", completeChangeScript);
+        }
+
+        private static object ParseUnsupportedColumns()
+        {
+            throw new NotImplementedException();
+        }
+
+        private static List<(string TableName, List<string> ColumnNames)> GetUnsupportedColumns()
+        {
+            const string columnSearchStartString = "-- Column(s) ";
+            const string columnSearchEndString = " are not included in";
+            const string tableSearchStartString = "-- Table: ";
+
+            var lines = _builder.ToString().Split(Environment.NewLine).ToList();
+            var unsupportedTables = new List<(string TableName, List<string> columnNames)>();
+
+            var index = -1;
+            while (true)
             {
-                var changeScript = GenerateChangeScript(t, parameters);
-                AppendChangeScript(changeScript);
+                index = lines.FindIndex(index + 1, s => s.StartsWith(columnSearchStartString));
+                if (index <= 0) break;
 
-                Interlocked.Increment(ref _counter);
-                Console.WriteLine($"Finised {_counter} of {totalCount}.");
-            });
+                var columnLine = lines[index];
+                var columnStartIndex = columnLine.IndexOf(columnSearchStartString);
+                var columnEndIndex = columnLine.IndexOf(columnSearchEndString);
+                if (columnStartIndex == -1 || columnEndIndex == -1)
+                    continue;
 
-            var completeChangeScript = _builder.ToString();
-            File.WriteAllText("changeScript.sql", completeChangeScript);
+                var columnList = columnLine
+                    .Substring(columnStartIndex + columnSearchStartString.Length,
+                        columnEndIndex - columnStartIndex - columnSearchStartString.Length)
+                    .Split(",", StringSplitOptions.RemoveEmptyEntries)
+                    .Select(s => s.Trim())
+                    .ToList();
+                if (columnList.Count == 0)
+                    continue;
+
+                var tableLine = lines[index - 1];
+                var tableStartIndex = tableLine.IndexOf(tableSearchStartString);
+                if (tableStartIndex == -1)
+                    continue;
+
+                var tableName = tableLine.Substring(tableStartIndex + tableSearchStartString.Length).Trim();
+                if (string.IsNullOrWhiteSpace(tableName))
+                    continue;
+
+                var table = (tableName, columnList);
+                unsupportedTables.Add(table);
+            }
+
+            return unsupportedTables;
         }
 
         private static void AppendChangeScript(string changeScript)
@@ -55,7 +112,7 @@ namespace ScriptDatabaseChanges
             var connStringBuilder = new SqlConnectionStringBuilder
             {
                 InitialCatalog = parameters.SourceDatabase,
-                DataSource = parameters.SourceServer,
+                DataSource = parameters.Server,
                 IntegratedSecurity = true
             };
 
@@ -66,10 +123,15 @@ namespace ScriptDatabaseChanges
 
                 using (var reader = sql.ExecuteReader())
                     tables = reader.Select(r => r.GetString(0)).ToList();
+
+                sql.CommandText = "SELECT opKurokoMainSettings FROM Operator WHERE opid = 33";
+                var result = sql.ExecuteScalar();
+                var type = result.GetType();
             }
 
             tables.Remove("CheckDBLog");
             tables.Remove("EventLog");
+            tables.Remove("DentalProcedureHistory");
 
             return tables;
         }
@@ -80,7 +142,7 @@ namespace ScriptDatabaseChanges
             var outputFile = $"{fileName}.sql";
 
             var diffCommandArguments =
-                $"-sourceserver {parameters.SourceServer} -sourcedatabase {parameters.SourceDatabase} -destinationserver {parameters.DestinationServer} -destinationdatabase {parameters.DestinationDatabase} -sourcetable {table} -destinationtable {table} -f \"{fileName}\"";
+                $"-sourceserver {parameters.Server} -sourcedatabase {parameters.SourceDatabase} -destinationserver {parameters.Server} -destinationdatabase {parameters.DestinationDatabase} -sourcetable {table} -destinationtable {table} -f \"{fileName}\"";
 
             var proc = Process.Start(@"C:\Program Files\Microsoft SQL Server\140\COM\tablediff.exe", diffCommandArguments);
             proc.WaitForExit();
@@ -119,16 +181,12 @@ namespace ScriptDatabaseChanges
 
                 switch (parameterName.ToLower().Replace("--", "").Replace("-", "").Replace("/", ""))
                 {
-                    case "sourceserver":
-                        parameters.SourceServer = parameterValue;
+                    case "server":
+                        parameters.Server = parameterValue;
                         break;
 
                     case "sourcedatabase":
                         parameters.SourceDatabase = parameterValue;
-                        break;
-
-                    case "destinationserver":
-                        parameters.DestinationServer = parameterValue;
                         break;
 
                     case "destinationdatabase":
@@ -147,9 +205,34 @@ namespace ScriptDatabaseChanges
     public class ProgramParameters
     {
         public string SourceDatabase { get; set; }
-        public string SourceServer { get; set; }
+        public string Server { get; set; }
         public string DestinationDatabase { get; set; }
-        public string DestinationServer { get; set; }
+    }
+
+    public struct AdditionalTable
+    {
+        public AdditionalTable(string name, string primaryKeyColumn)
+        {
+            Name = name;
+            PrimaryKeyColumn = primaryKeyColumn;
+            AdditionalColumns = new List<AdditionalColumn>();
+        }
+
+        public string Name { get; }
+        public string PrimaryKeyColumn { get; }
+        public List<AdditionalColumn> AdditionalColumns { get; }
+    }
+
+    public struct AdditionalColumn
+    {
+        public string Name { get; }
+        public SqlDbType DataType { get; }
+
+        public AdditionalColumn(string name, SqlDbType dataType)
+        {
+            Name = name;
+            DataType = dataType;
+        }
     }
 
     public static class Extensions
