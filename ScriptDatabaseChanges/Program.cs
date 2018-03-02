@@ -23,31 +23,193 @@ namespace ScriptDatabaseChanges
         {
 
             var parameters = ParseParameters(args);
-            // TableDiffFilePath = GetTableDiffUtilityPath();
+            TableDiffFilePath = GetTableDiffUtilityPath();
 
-            // var tables = GetTableList(parameters);
+            var tables = GetTableList(GetSourceDatabaseConnectionString(parameters));
 
-            // var totalCount = tables.Count;
-            // Parallel.ForEach(tables, t =>
-            // {
-            //     var changeScript = GenerateChangeScript(t, parameters);
-            //     AppendChangeScript(changeScript);
+            var totalCount = tables.Count;
+            Parallel.ForEach(tables, t =>
+            {
+                var changeScript = GenerateChangeScript(t, parameters);
+                AppendChangeScript(changeScript);
 
-            //     Interlocked.Increment(ref _counter);
-            //     Console.WriteLine($"Finised {_counter} of {totalCount}.");
-            // });
-            _builder = new StringBuilder(File.ReadAllText("changeScript.sql"));
+                Interlocked.Increment(ref _counter);
+                Console.WriteLine($"Finised {_counter} of {totalCount}.");
+            });
 
             var tablesWithUnsupportedColumns = GetUnsupportedColumns();
-            var columnsToCheck = ParseUnsupportedColumns();
+            var columnsToCheck = ParseUnsupportedColumns(tablesWithUnsupportedColumns,
+                GetSourceDatabaseConnectionString(parameters));
 
-            // var completeChangeScript = _builder.ToString();
-            // File.WriteAllText("changeScript.sql", completeChangeScript);
+            GenerateDataFilesForUnsupportedColumns(columnsToCheck, parameters);
+            var completeChangeScript = _builder.ToString();
+            File.WriteAllText("changeScript.sql", completeChangeScript);
         }
 
-        private static object ParseUnsupportedColumns()
+        private static void GenerateDataFilesForUnsupportedColumns(List<AdditionalTable> columnsToCheck,
+            ProgramParameters parameters)
         {
-            throw new NotImplementedException();
+            using (var conn = new SqlConnection(GetSourceDatabaseConnectionString(parameters)))
+            {
+                conn.Open();
+                foreach (var table in columnsToCheck)
+                {
+                    var baseSql =
+                        $@"SELECT
+                            [S].{table.PrimaryKeyColumn}
+                        FROM
+                            [{parameters.DestinationDatabase}].{table.Name} [T]
+                            INNER JOIN [{parameters.SourceDatabase}].{table.Name} [S] ON [T].{table.PrimaryKeyColumn} = [S].{table.PrimaryKeyColumn} ";
+
+                    foreach (var column in table.AdditionalColumns)
+                    {
+                        string whereClause;
+                        switch (column.DataType)
+                        {
+                            case SqlDbType.Xml:
+                                whereClause = $"CAST([T].{column.Name} as varbinary(max)) != CAST([S].{column.Name} as varbinary(max))";
+                                break;
+
+                            default:
+                                throw new Exception("Datatype is not implemented");
+                        }
+
+                        List<int> primaryKeys;
+                        using (var sql = new SqlCommand($"{baseSql} WHERE {whereClause}", conn))
+                        using (var reader = sql.ExecuteReader())
+                            primaryKeys = reader.Select(r => r.GetInt32(0)).ToList();
+
+                        if (primaryKeys == null || primaryKeys.Count == 0) continue;
+
+                        foreach (var primaryKey in primaryKeys)
+                        {
+                            using (var sql = new SqlCommand($"SELECT {column.Name} FROM {table.Name} WHERE {table.PrimaryKeyColumn} = {primaryKey}", conn))
+                            {
+                                var columnValue = sql.ExecuteScalar();
+
+                                var directory = $"{table.Name.Replace("[","").Replace("]","").Replace(".","/")}_{table.PrimaryKeyColumn}/{column.Name}_{column.DataType}";
+                                var fileName = $"{directory}/{primaryKey}.data";
+                                if (Directory.Exists(directory) == false)
+                                    Directory.CreateDirectory(directory);
+
+                                switch (column.DataType)
+                                {
+                                    case SqlDbType.Xml:
+                                    case SqlDbType.VarChar:
+                                    case SqlDbType.NVarChar:
+                                        File.WriteAllText(fileName, (string)columnValue);
+                                        break;
+
+                                    default:
+                                        throw new Exception("Datatype is not implemented");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+
+        private static List<AdditionalTable> ParseUnsupportedColumns(List<(string TableName, List<string> ColumnNames)> columnList
+            , string connectionString)
+        {
+
+            var unsupportedColumns = new List<(string TableName, string ColumnName, string DataType, string PkColumn)>();
+            const string unsupportedColumnQuery =
+                @"SELECT 
+                    '[' + [C].TABLE_SCHEMA + '].[' + [C].TABLE_NAME + ']' [TABLE_NAME], COLUMN_NAME, DATA_TYPE, [PkColumn]
+                FROM 
+                    INFORMATION_SCHEMA.COLUMNS [C] 
+                    INNER JOIN INFORMATION_SCHEMA.TABLES [T] ON [C].TABLE_NAME = [T].TABLE_NAME 
+					CROSS APPLY
+						(SELECT        
+							TOP 1 CCU.COLUMN_NAME [PkColumn]
+						FROM	            
+							INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS TC INNER JOIN
+							INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS CCU ON CCU.CONSTRAINT_NAME = TC.CONSTRAINT_NAME
+						WHERE        
+							TC.CONSTRAINT_TYPE = 'PRIMARY KEY' AND TC.TABLE_NAME = [T].TABLE_NAME) [PK]
+                    LEFT OUTER JOIN (SELECT OBJECT_NAME(object_id) [TName], [name] [CName] FROM sys.computed_columns) [Computed] ON [T].TABLE_NAME = [Computed].TName AND [C].COLUMN_NAME = [Computed].CName
+                WHERE 
+                    TABLE_TYPE = 'BASE TABLE'
+                    AND 
+                    (
+                        (DATA_TYPE IN ('varchar', 'nvarchar', 'varbinary') AND CHARACTER_MAXIMUM_LENGTH = -1)
+                        OR
+                        DATA_TYPE IN ('text', 'ntext', 'image', 'timestamp', 'xml')
+                    )
+                    AND [Computed].CName IS NULL";
+
+            using (var conn = new SqlConnection(connectionString))
+            using (var sql = new SqlCommand(unsupportedColumnQuery, conn))
+            {
+                conn.Open();
+                using (var reader = sql.ExecuteReader())
+                    unsupportedColumns = reader.Select(r => (r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3))).ToList();
+            }
+
+
+            var additionalTables = new List<AdditionalTable>();
+            foreach (var changedColumn in columnList)
+            {
+                var tableEntry = unsupportedColumns.FirstOrDefault(c =>
+                    string.Equals(c.TableName, changedColumn.TableName, StringComparison.CurrentCultureIgnoreCase));
+                if (string.IsNullOrWhiteSpace(tableEntry.TableName)) continue;
+
+                var table = new AdditionalTable(tableEntry.TableName, tableEntry.PkColumn);
+                foreach (var columnName in changedColumn.ColumnNames)
+                {
+                    var columnEntry = unsupportedColumns.FirstOrDefault(c => c.ColumnName == columnName);
+                    if (string.IsNullOrWhiteSpace(columnEntry.ColumnName)) continue;
+
+                    SqlDbType type;
+                    switch (columnEntry.DataType)
+                    {
+                        case "image":
+                            type = SqlDbType.Image;
+                            break;
+
+                        case "nvarchar":
+                            type = SqlDbType.NVarChar;
+                            break;
+
+                        case "varbinary":
+                            type = SqlDbType.VarBinary;
+                            break;
+
+                        case "varchar":
+                            type = SqlDbType.VarChar;
+                            break;
+
+                        case "xml":
+                            type = SqlDbType.Xml;
+                            break;
+
+                        case "text":
+                            type = SqlDbType.Text;
+                            break;
+
+                        case "ntext":
+                            type = SqlDbType.NText;
+                            break;
+
+                        case "timestamp":
+                            type = SqlDbType.Timestamp;
+                            break;
+
+                        default:
+                            throw new Exception("Datatype is not implemented");
+                    }
+                    table.AdditionalColumns.Add(new AdditionalColumn(columnName, type));
+                }
+                if (table.AdditionalColumns.Count == 0)
+                    continue;
+
+                additionalTables.Add(table);
+            }
+
+            return additionalTables;
         }
 
         private static List<(string TableName, List<string> ColumnNames)> GetUnsupportedColumns()
@@ -106,9 +268,8 @@ namespace ScriptDatabaseChanges
             }
         }
 
-        private static List<string> GetTableList(ProgramParameters parameters)
+        public static string GetSourceDatabaseConnectionString(ProgramParameters parameters)
         {
-            List<string> tables = null;
             var connStringBuilder = new SqlConnectionStringBuilder
             {
                 InitialCatalog = parameters.SourceDatabase,
@@ -116,7 +277,15 @@ namespace ScriptDatabaseChanges
                 IntegratedSecurity = true
             };
 
-            using (var conn = new SqlConnection(connStringBuilder.ToString()))
+            return connStringBuilder.ToString();
+        }
+
+        private static List<string> GetTableList(string connectionString)
+        {
+            List<string> tables = null;
+
+
+            using (var conn = new SqlConnection(connectionString))
             using (var sql = new SqlCommand("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'", conn))
             {
                 conn.Open();
